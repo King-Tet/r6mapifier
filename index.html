@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>R6 Map Generator V2 - Color & Types</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; }
+        #info { position: absolute; top: 10px; left: 10px; color: white; font-family: sans-serif; pointer-events: none; background: rgba(0,0,0,0.5); padding: 10px;}
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">Let's Go V2<br>Solid Walls: Grey | Breakable: Orange | LOS: Red Transparent<br>Left Click: Rotate | Right Click: Pan | Scroll: Zoom</div>
+    
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+        // Add some fog for depth
+        scene.fog = new THREE.Fog(0x222222, 500, 2000);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 5000);
+        camera.position.set(0, 900, 500);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI / 2 - 0.1; // Prevent going below ground
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(200, 500, 300);
+        dirLight.castShadow = true;
+        // Increase shadow map size for sharper shadows on large maps
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // =================NEW IN V2: MATERIAL DEFINITIONS=================
+        const materials = {
+            // Standard Wall (Grey, Rough)
+            wall_solid: new THREE.MeshStandardMaterial({ 
+                color: 0x999999, roughness: 0.9, metalness: 0.1 
+            }),
+            // Breakable Wall (Orange/Wood color)
+            wall_breakable: new THREE.MeshStandardMaterial({ 
+                color: 0xd4a03d, roughness: 0.6, metalness: 0.0 
+            }),
+            // LOS Wall (Red, semi-transparent)
+            wall_los: new THREE.MeshStandardMaterial({ 
+                color: 0xff0000, transparent: true, opacity: 0.4, roughness: 0.1, side: THREE.DoubleSide
+            }),
+             // Floor Trap (Orange, slightly raised)
+            floor_trap: new THREE.MeshStandardMaterial({ 
+                color: 0xd4a03d, roughness: 0.8 
+            }),
+             // LOS Floor (Red, slightly raised)
+            floor_los: new THREE.MeshStandardMaterial({ 
+                color: 0x990000, roughness: 0.8 
+            })
+        };
+        // =================================================================
+
+        async function loadMap() {
+            try {
+                const response = await fetch('./map_data.json');
+                const data = await response.json();
+                generateLevel(data);
+            } catch (error) {
+                console.error("Error loading JSON. Server running?", error);
+            }
+        }
+
+        function generateLevel(data) {
+            // 1. Base Ground Plane
+            // We lower this slightly (-2) to prevent flickering with floor tiles
+            const planeGeo = new THREE.PlaneGeometry(data.dimensions.width * 1.5, data.dimensions.height * 1.5);
+            const planeMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a });
+            const floorMesh = new THREE.Mesh(planeGeo, planeMat);
+            
+            // Rotate -90 degrees so the front face points UP
+            floorMesh.rotation.x = -Math.PI / 2; 
+            floorMesh.position.y = -2; 
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            data.objects.forEach(obj => {
+                if (obj.points.length < 2) return;
+
+                const shape = new THREE.Shape();
+                shape.moveTo(obj.points[0][0], obj.points[0][1]);
+                for (let i = 1; i < obj.points.length; i++) {
+                    shape.lineTo(obj.points[i][0], obj.points[i][1]);
+                }
+                shape.closePath();
+
+                const mat = materials[obj.type] || materials.wall_solid;
+
+                if (obj.category === "wall") {
+                    // === Extrude Walls ===
+                    const extrudeSettings = { steps: 1, depth: 50, bevelEnabled: false };
+                    const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+                    const mesh = new THREE.Mesh(geometry, mat);
+                    
+                    // FIX: Rotate -90 degrees so they stand UP (+Y) not DOWN (-Y)
+                    mesh.rotation.x = -Math.PI / 2; 
+                    
+                    mesh.castShadow = obj.type !== 'wall_los'; 
+                    mesh.receiveShadow = true;
+                    scene.add(mesh);
+
+                } else if (obj.category === "floor") {
+                    // === Create Flat Floor Meshes ===
+                    const geometry = new THREE.ShapeGeometry(shape);
+                    const mesh = new THREE.Mesh(geometry, mat);
+                    
+                    // FIX: Rotate -90 degrees so the visible side faces the camera
+                    mesh.rotation.x = -Math.PI / 2;
+                    
+                    // Lift them slightly (y=1) so they sit ON TOP of the base ground
+                    mesh.position.y = 1; 
+                    mesh.receiveShadow = true;
+                    scene.add(mesh);
+                }
+            });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        loadMap();
+        animate();
+    </script>
+</body>
+</html>
