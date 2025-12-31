@@ -78,7 +78,10 @@
 
         async function loadMap() {
             try {
-                const response = await fetch('./map_data.json');
+                // Add a random number to the end of the URL to prevent caching
+                const bustCache = new Date().getTime();
+                const response = await fetch(`./map_data.json?t=${bustCache}`);
+                
                 const data = await response.json();
                 generateLevel(data);
             } catch (error) {
