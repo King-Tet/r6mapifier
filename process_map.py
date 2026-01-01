@@ -8,7 +8,7 @@ def process_map(image_filename, output_filename):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     full_image_path = os.path.join(script_dir, image_filename)
     full_output_path = os.path.join(script_dir, output_filename)
-    debug_image_path = os.path.join(script_dir, "debug_final_v18.jpg")
+    debug_image_path = os.path.join(script_dir, "debug_final_v16.jpg")
 
     print(f"Processing: {full_image_path}")
     img = cv2.imread(full_image_path)
@@ -23,24 +23,39 @@ def process_map(image_filename, output_filename):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
     # 2. Color Ranges
+    # 2. Color Ranges
     lower_white = np.array([0, 0, 215])
     upper_white = np.array([180, 40, 255])
 
     lower_yellow = np.array([15, 120, 120])
     upper_yellow = np.array([40, 255, 255])
 
-    # Widen Red Range (V17 Fix)
-    lower_red1 = np.array([0, 80, 80])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([160, 80, 80])
-    upper_red2 = np.array([180, 255, 255])
+    # (STRICT for Hull/Windows, LOOSE for Floors)
+    # Strict (Old) - Keeps hull tight, preserves windows
+    lower_red1_strict = np.array([0, 100, 100])
+    upper_red1_strict = np.array([10, 255, 255])
+    lower_red2_strict = np.array([160, 100, 100])
+    upper_red2_strict = np.array([180, 255, 255])
+
+    # Loose (New) - Catch dark floors
+    lower_red1_loose = np.array([0, 60, 60])
+    upper_red1_loose = np.array([10, 255, 255])
+    lower_red2_loose = np.array([160, 60, 60])
+    upper_red2_loose = np.array([180, 255, 255])
 
     # 3. Create Masks
     mask_struct_raw = cv2.inRange(hsv, lower_white, upper_white)
     mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+    
+    # Strict Red Masks
+    mask_red1_strict = cv2.inRange(hsv, lower_red1_strict, upper_red1_strict)
+    mask_red2_strict = cv2.inRange(hsv, lower_red2_strict, upper_red2_strict)
+    mask_red_strict = cv2.bitwise_or(mask_red1_strict, mask_red2_strict)
+
+    # Loose Red Masks
+    mask_red1_loose = cv2.inRange(hsv, lower_red1_loose, upper_red1_loose)
+    mask_red2_loose = cv2.inRange(hsv, lower_red2_loose, upper_red2_loose)
+    mask_red_loose = cv2.bitwise_or(mask_red1_loose, mask_red2_loose)
 
     # 4. Cleaning & Fusing
     kernel_clean = np.ones((3,3), np.uint8)
@@ -48,104 +63,111 @@ def process_map(image_filename, output_filename):
     
     mask_struct = cv2.morphologyEx(mask_struct_raw, cv2.MORPH_OPEN, kernel_clean)
     
-    # === FIX: PRESERVE THIN RED FLOORS ===
-    # Do not fuse red mask aggressively. Use raw or very light close.
-    mask_red_fused = mask_red.copy() 
+    # Fused Masks
+    mask_red_strict_fused = cv2.morphologyEx(mask_red_strict, cv2.MORPH_CLOSE, kernel_fuse)
+    
+    # SPLIT LOGIC (V10): Use OPEN instead of CLOSE for loose red. 
+    # carpets are often connected to floors by thin pixel bridges. 
+    # Open will break these bridges.
+    mask_red_loose_fused = cv2.morphologyEx(mask_red_loose, cv2.MORPH_OPEN, kernel_fuse)
     
     mask_yellow_fused = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel_fuse)
 
-    # ================= FIX 1: ROBUST HULL (CLEAN + GENERATE) =================
+    # ================= HULL CALCULATIONS =================
     # Building = Where there is ANY structure or floor.
-    mask_building_mass = cv2.bitwise_or(mask_struct, mask_red_fused)
+    # USE STRICT MASK for Hull to avoid closing windows
+    mask_building_mass = cv2.bitwise_or(mask_struct, mask_red_strict_fused)
     mask_building_mass = cv2.bitwise_or(mask_building_mass, mask_yellow_fused)
     
-    # === FIX: CLEAN NOISE BEFORE HULL ===
-    # Open to remove small outside blobs that confuse the hull
-    kernel_noise_remove = np.ones((5,5), np.uint8)
-    mask_building_mass = cv2.morphologyEx(mask_building_mass, cv2.MORPH_OPEN, kernel_noise_remove)
-
-    # Close to satisfy the "Solid Block" requirement
-    # Reverted to 25x25 (Middle ground between 20 and 35)
-    kernel_hull = np.ones((25,25), np.uint8) 
-    mask_hull_generation = cv2.morphologyEx(mask_building_mass, cv2.MORPH_CLOSE, kernel_hull)
+    # 1. Tight Hull (For Window Detection)
+    kernel_hull = np.ones((20,20), np.uint8) 
+    mask_hull_closed = cv2.morphologyEx(mask_building_mass, cv2.MORPH_CLOSE, kernel_hull)
     
-    # Dilate Hull for ROI checks
-    kernel_spacer = np.ones((15,15), np.uint8)
-    mask_hull_roi = cv2.dilate(mask_hull_generation, kernel_spacer, iterations=1)
+    contours_tight, _ = cv2.findContours(mask_hull_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    tight_hull_contour = max(contours_tight, key=cv2.contourArea) if contours_tight else None
 
-    contours_hull_gen, _ = cv2.findContours(mask_hull_generation, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours_hull_roi, _ = cv2.findContours(mask_hull_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 2. Dilated Hull (For Output Spacer & Object Filtering)
+    # User wanted a Spacer to avoid cutting off windows.
+    kernel_spacer = np.ones((11,11), np.uint8)
+    mask_hull_dilated = cv2.dilate(mask_hull_closed, kernel_spacer, iterations=1)
+    
+    contours_dilated, _ = cv2.findContours(mask_hull_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     mask_roi = np.zeros((h_img, w_img), dtype=np.uint8)
-    hull_contour_gen = None
+    dilated_hull_contour = None
     
-    if contours_hull_roi:
-        roi_contour = max(contours_hull_roi, key=cv2.contourArea)
-        cv2.drawContours(mask_roi, [roi_contour], -1, 255, -1)
-        # cv2.drawContours(debug_view, [roi_contour], -1, (255, 0, 255), 2) # Dilated Hull (Optional)
+    if contours_dilated:
+        dilated_hull_contour = max(contours_dilated, key=cv2.contourArea)
+        cv2.drawContours(mask_roi, [dilated_hull_contour], -1, 255, -1)
+        cv2.drawContours(debug_view, [dilated_hull_contour], -1, (255, 0, 255), 2) # Purple Hull (Spaced)
 
-    if contours_hull_gen:
-        hull_contour_gen = max(contours_hull_gen, key=cv2.contourArea)
-        cv2.drawContours(debug_view, [hull_contour_gen], -1, (255, 0, 255), 2) # Tight Hull
-
-    # ================= FIX 2: WINDOWS (PERIMETER INTERSECTION) =================
-    # Create a mask of the "Border Region"
-    mask_perimeter = np.zeros((h_img, w_img), dtype=np.uint8)
-    if hull_contour_gen is not None:
-        cv2.drawContours(mask_perimeter, [hull_contour_gen], -1, 255, 30) # Draw thick border (30px)
-        
-    # Intersect White Struct with Perimeter
-    mask_edge_structures = cv2.bitwise_and(mask_struct, mask_perimeter)
+    # ================= WINDOWS (GAPS IN TIGHT MASS) =================
+    # Use TIGHT hull for gaps.
+    mask_gaps_raw = cv2.subtract(mask_hull_closed, mask_struct)
+    mask_gaps = cv2.morphologyEx(mask_gaps_raw, cv2.MORPH_OPEN, kernel_clean)
     
-    contours_edge, _ = cv2.findContours(mask_edge_structures, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_gaps, _ = cv2.findContours(mask_gaps, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     valid_window_contours = []
     
-    for cnt in contours_edge:
-        area = cv2.contourArea(cnt)
-        if area < 30: continue
-        if area > 1000: continue # Windows aren't huge
-        
-        hull = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        if hull_area == 0: continue
-        
-        solidity = float(area) / hull_area
-        
-        x,y,w,h = cv2.boundingRect(cnt)
-        aspect_ratio = float(w)/h if h>0 else 0
-        if aspect_ratio < 1.0: aspect_ratio = 1.0/aspect_ratio if aspect_ratio>0 else 0
-        
-        # Windows Check:
-        # 1. Low Solidity (Spindly/Linear) -> < 0.7
-        # 2. High Aspect Ratio -> > 2.0
-        
-        is_window = False
-        if solidity < 0.65:
-            is_window = True
-        elif aspect_ratio > 1.8:
-            is_window = True
+    if tight_hull_contour is not None:
+        for cnt in contours_gaps:
+            area = cv2.contourArea(cnt)
+            if area < 80: continue 
+            if area > 3000: continue 
             
-        if is_window:
-            valid_window_contours.append(cnt)
-            cv2.rectangle(debug_view, (x,y), (x+w, y+h), (255, 255, 0), 2) # Cyan
+            x,y,w,h = cv2.boundingRect(cnt)
+            
+            # Aspect Ratio Filter (Ignore Squares)
+            aspect_ratio = float(w)/h if h > 0 else 0
+            if aspect_ratio < 1: aspect_ratio = 1.0 / aspect_ratio
+            
+            # Windows are usually thin (High Aspect Ratio)
+            if aspect_ratio < 1.3: # Relaxed slightly from 1.5 
+                continue 
+
+            M = cv2.moments(cnt)
+            if M["m00"] == 0: continue
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            
+            # Check proximity to TIGHT Hull Edge
+            dist = cv2.pointPolygonTest(tight_hull_contour, (cX, cY), True)
+            
+            if 0 <= dist < 35: 
+                valid_window_contours.append(cnt)
+                cv2.rectangle(debug_view, (x,y), (x+w, y+h), (255, 255, 0), 2) # Cyan
 
     # ================= PATTERN ANALYSIS =================
     def analyze_pattern(object_mask, area, hsv_image):
         hue, sat, val = cv2.split(hsv_image)
         val = cv2.equalizeHist(val) 
         edges = cv2.Canny(val, 50, 150)
-        internal_edges = cv2.bitwise_and(edges, edges, mask=object_mask)
+        
+        # Erode mask to avoid picking up boundary edges as lines
+        # This fixes the "Curved Hallway" issue where outline lines > diagonal lines
+        kernel_erode = np.ones((3,3), np.uint8)
+        mask_internal = cv2.erode(object_mask, kernel_erode, iterations=1)
+        
+        internal_edges = cv2.bitwise_and(edges, edges, mask=mask_internal)
         lines = cv2.HoughLinesP(internal_edges, 1, np.pi/180, threshold=15, minLineLength=10, maxLineGap=10)
 
         if lines is None:
-            return {"density": 0, "coherence": 0, "lines": [], "is_solid": True}
+            return {"density": 0, "coherence": 0, "lines": [], "is_solid": True, "diag_ratio": 0, "std": 0}
         
         angles = []
+        diag_lines = 0
         for line in lines:
             x1, y1, x2, y2 = line[0]
             angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
             if angle < 0: angle += 180
             angles.append(angle)
+            
+            # Check diagonal (approx 45 or 135 deg, +/- 15 deg tolerance)
+            # 45 deg +/- 15 -> 30-60
+            # 135 deg +/- 15 -> 120-150
+            if (30 < angle < 60) or (120 < angle < 150):
+                diag_lines += 1
 
         hist, bins = np.histogram(angles, bins=18, range=(0, 180))
         max_lines_in_bucket = np.max(hist)
@@ -155,8 +177,9 @@ def process_map(image_filename, output_filename):
         density = (total_lines * 1000) / area if area > 0 else 0
         mean_s, std_s = cv2.meanStdDev(sat, mask=object_mask)
         is_solid = std_s[0][0] < 20 
+        diag_ratio = diag_lines / total_lines if total_lines > 0 else 0
         
-        return {"density": density, "coherence": coherence, "lines": lines, "is_solid": is_solid}
+        return {"density": density, "coherence": coherence, "lines": lines, "is_solid": is_solid, "diag_ratio": diag_ratio, "std": std_s[0][0]}
 
     map_objects = []
 
@@ -166,7 +189,7 @@ def process_map(image_filename, output_filename):
             area = cv2.contourArea(cnt)
             if area < 50: continue
             
-            # --- ROI CHECK (Use DILATED Mask) ---
+            # --- ROI CHECK (Use DILATED Hull) ---
             M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cX = int(M["m10"] / M["m00"])
@@ -185,10 +208,47 @@ def process_map(image_filename, output_filename):
             if obj_category == "floor":
                 stats = analyze_pattern(single_obj_mask, area, hsv)
                 if obj_type == "floor_los": 
-                    if stats["lines"] is None or len(stats["lines"]) < 2 or stats["coherence"] < 0.3:
+                    # Require diagonal lines logic to differentiate from carpets/solid red
+                    
+                    if stats["lines"] is None or len(stats["lines"]) < 2:
                         continue 
-                    for line in stats["lines"]:
-                        cv2.line(debug_view, (line[0][0], line[0][1]), (line[0][2], line[0][3]), (0, 255, 0), 2)
+
+                    # AREA-BASED FILTER (V8):
+                    # Assumption: Carpets/Noise are small (< 1000 px). Valid rooms/hallways are large (> 1000 px).
+                    
+                    diag = stats["diag_ratio"]
+                    std = stats["std"]
+                    
+                    if area > 1000:
+                         # Large Object (Hallway/Room): Relaxed checks
+                         # V11 TUNING: Raised from 0.05 to 0.10 based on split stats.
+                         # Carpet = 0.08 (REJECT)
+                         # Hallway = 0.21 (ACCEPT)
+                         if diag < 0.10: continue 
+                         if std < 10: continue
+                    else:
+                         # Small Object (Likely Carpet/Artifact): Strict checks
+                         if diag < 0.20: continue 
+                         if std < 25: continue
+                    print(f"ACCEPTED Floor: Area={area}, Diag={stats['diag_ratio']:.2f}, Std={stats['std']:.2f}, Coh={stats['coherence']:.2f}")
+
+                    # Draw Stats on Image for Debugging
+                    M = cv2.moments(cnt)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        # Draw Text with black border for visibility
+                        label = f"D:{diag:.2f} C:{stats['coherence']:.2f}"
+                        cv2.putText(debug_view, label, (cX - 20, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+                        cv2.putText(debug_view, label, (cX - 20, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                    # Draw OUTLINE (Cyan) to show the full detected area
+                    cv2.drawContours(debug_view, [cnt], -1, (255, 255, 0), 3)
+
+                    # Hide internal green lines (confusing user)
+                    # if stats["lines"] is not None:
+                    #     for line in stats["lines"]:
+                    #         cv2.line(debug_view, (line[0][0], line[0][1]), (line[0][2], line[0][3]), (0, 255, 0), 2)
                 elif obj_type == "floor_trap":
                     if stats["density"] < 0.3: continue
                     for line in stats["lines"]:
@@ -197,7 +257,8 @@ def process_map(image_filename, output_filename):
             if obj_category == "wall":
                 yellow_overlap = cv2.countNonZero(cv2.bitwise_and(single_obj_mask, mask_yellow_fused))
                 overlap_ratio_y = yellow_overlap / area 
-                red_overlap = cv2.countNonZero(cv2.bitwise_and(single_obj_mask, mask_red_fused))
+                # Use LOOSE red for walls too, just in case
+                red_overlap = cv2.countNonZero(cv2.bitwise_and(single_obj_mask, mask_red_loose_fused))
                 overlap_ratio_r = red_overlap / area
                 
                 if overlap_ratio_y > 0.3: 
@@ -208,6 +269,8 @@ def process_map(image_filename, output_filename):
                             cv2.line(debug_view, (line[0][0], line[0][1]), (line[0][2], line[0][3]), (255, 0, 0), 2)
                 elif overlap_ratio_r > 0.3:
                      obj_type = "wall_los"
+                     # Draw debug for wall_los so user can see what's being detected
+                     cv2.drawContours(debug_view, [cnt], -1, (0, 0, 255), 2)
 
             map_objects.append({"category": obj_category, "type": obj_type, "points": points})
             processed_count += 1
@@ -217,35 +280,32 @@ def process_map(image_filename, output_filename):
     windows_to_export = contours_to_json(valid_window_contours, "window", "window")
 
     # Walls
-    # Subtract Windows from Struct
-    mask_windows_found = np.zeros((h_img, w_img), dtype=np.uint8)
-    cv2.drawContours(mask_windows_found, valid_window_contours, -1, 255, -1)
-    
-    mask_walls_clean = cv2.subtract(mask_struct, mask_windows_found)
-    contours_struct, _ = cv2.findContours(mask_walls_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_struct, _ = cv2.findContours(mask_struct, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     walls_found = contours_to_json(contours_struct, "wall_solid", "wall")
 
     # Floors
+    # ================= FIX 3: PRESERVE THIN FLOORS =================
     mask_floors_area = cv2.subtract(mask_roi, mask_struct) 
     
     floors_yellow = cv2.bitwise_and(mask_yellow_fused, mask_yellow_fused, mask=mask_floors_area)
-    floors_yellow = cv2.morphologyEx(floors_yellow, cv2.MORPH_OPEN, kernel_clean)
     cnt_y, _ = cv2.findContours(floors_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     floors_y_found = contours_to_json(cnt_y, "floor_trap", "floor")
     
-    # Red Floors (Unfiltered for thin lines)
-    floors_red = cv2.bitwise_and(mask_red_fused, mask_red_fused, mask=mask_floors_area)
+    # Red Floors - Skip/Min cleaning
+    # Use LOOSE red for floors
+    floors_red = cv2.bitwise_and(mask_red_loose_fused, mask_red_loose_fused, mask=mask_floors_area)
+    # No opening here to save thin lines
     cnt_r, _ = cv2.findContours(floors_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     floors_r_found = contours_to_json(cnt_r, "floor_los", "floor")
 
     output_data = {"dimensions": {"width": w_img, "height": h_img}, "objects": map_objects}
 
     cv2.imwrite(debug_image_path, debug_view)
-    print(f"V18 Debug saved to: {debug_image_path}")
+    print(f"V16 Debug saved to: {debug_image_path}")
 
     with open(full_output_path, 'w') as f:
         json.dump(output_data, f)
-        print(f"V18 Done. Windows: {windows_to_export}, Walls: {walls_found}, Floors: {floors_y_found + floors_r_found}")
+        print(f"V16 Done. Windows: {windows_to_export}, Walls: {walls_found}, Floors: {floors_y_found + floors_r_found}")
 
 if __name__ == "__main__":
     process_map('map.jpg', 'map_data.json')
