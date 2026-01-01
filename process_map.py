@@ -197,7 +197,9 @@ def process_map(image_filename, output_filename):
                 if mask_roi[cY, cX] == 0:
                     continue 
 
-            epsilon = 0.002 * cv2.arcLength(cnt, True)
+            # SMOOTHING (V13): Reduced epsilon to 0.001 (High Detail) + Mask Smoothing
+            # This avoids "spikey" shards by tracing the smoothed mask closely.
+            epsilon = 0.001 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             points = [[int(p[0][0] - w_img/2), int(-(p[0][1] - h_img/2))] for p in approx]
 
@@ -294,6 +296,10 @@ def process_map(image_filename, output_filename):
     # Red Floors - Skip/Min cleaning
     # Use LOOSE red for floors
     floors_red = cv2.bitwise_and(mask_red_loose_fused, mask_red_loose_fused, mask=mask_floors_area)
+    
+    # SMOOTHING MASK (V13): Flatten pixel stairs before finding contours
+    floors_red = cv2.medianBlur(floors_red, 5)
+    
     # No opening here to save thin lines
     cnt_r, _ = cv2.findContours(floors_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     floors_r_found = contours_to_json(cnt_r, "floor_los", "floor")
